@@ -2,6 +2,7 @@
 #include <ATen/AccumulateType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
+#include "compat.h"
 
 #include <assert.h>
 
@@ -45,19 +46,23 @@ void multi_tensor_apply(
   T callable,
   ArgTypes... args)
 {
-  AT_CHECK(tensor_lists.size() == depth, "tensor_lists.size() != depth");
+  TORCH_CHECK(tensor_lists.size() == depth, "tensor_lists.size() != depth");
   int len0 = tensor_lists[0].size();
-  AT_CHECK(len0 > 0, "tensor_lists[0].size() is not > 0");
+  TORCH_CHECK(len0 > 0, "tensor_lists[0].size() is not > 0");
 
   for(int l = 0; l < tensor_lists.size(); l++) // No range-based for because I need indices
   {
-    AT_CHECK(tensor_lists[l].size() == len0, "Size mismatch among tensor lists");
+    TORCH_CHECK(tensor_lists[l].size() == len0, "Size mismatch among tensor lists");
     for(int t = 0; t < tensor_lists[l].size(); t++)
     {
       // TODO:  Print which tensor fails.
-      AT_CHECK(tensor_lists[l][t].is_contiguous(), "A tensor was not contiguous.");
-      AT_CHECK(tensor_lists[l][t].is_cuda(), "A tensor was not cuda.");
-      AT_CHECK(tensor_lists[l][t].numel() == tensor_lists[0][t].numel(), "Size mismatch");
+      bool contiguous_memory = tensor_lists[l][t].is_contiguous();
+#ifdef VERSION_GE_1_5
+      contiguous_memory = (contiguous_memory || tensor_lists[l][t].is_contiguous(at::MemoryFormat::ChannelsLast));
+#endif
+      TORCH_CHECK(contiguous_memory, "A tensor was not contiguous.");
+      TORCH_CHECK(tensor_lists[l][t].is_cuda(), "A tensor was not cuda.");
+      TORCH_CHECK(tensor_lists[l][t].numel() == tensor_lists[0][t].numel(), "Size mismatch");
     }
   }
 
@@ -95,7 +100,7 @@ void multi_tensor_apply(
         // using accscalar_t = acc_type<scalar_t, true>;
         multi_tensor_apply_kernel<<<loc_block_info, block_size, 0, stream>>>(
           chunk_size,
-          noop_flag.data<int>(),
+          noop_flag.DATA_PTR<int>(),
           tl,
           callable,
           args...);

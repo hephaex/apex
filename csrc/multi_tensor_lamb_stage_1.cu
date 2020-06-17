@@ -14,7 +14,7 @@
 #define ILP 4
 
 // Step 1 computes the 'update' value of regular Adam optimizer.
-template<typename GRAD_T, typename T>
+template<typename GRAD_T, typename T, typename UPD_T>
 struct LAMBStage1Functor
 {
    __device__ __forceinline__ void operator()(
@@ -52,7 +52,7 @@ struct LAMBStage1Functor
     T* v = (T*)tl.addresses[3][tensor_loc];
     v += chunk_idx*chunk_size;
 
-    T* update = (T*)tl.addresses[4][tensor_loc];
+    UPD_T* update = (UPD_T*)tl.addresses[4][tensor_loc];
     update += chunk_idx*chunk_size;
 
     n -= chunk_idx*chunk_size;
@@ -62,19 +62,47 @@ struct LAMBStage1Functor
             i_start < n && i_start < chunk_size;
             i_start += blockDim.x*ILP)
     {
+      GRAD_T r_g[ILP];
+      T r_p[ILP];
+      T r_m[ILP];
+      T r_v[ILP];
 #pragma unroll
       for(int ii = 0; ii < ILP; ii++)
       {
         int i = i_start + threadIdx.x + ii*blockDim.x;
         if(i < n && i < chunk_size)
         {
-          T scaled_grad = g[i] / clipped_global_grad_norm;
-          m[i] = m[i] * beta1 + (1-beta1) * scaled_grad;
-          v[i] = v[i] * beta2 + (1-beta2) * scaled_grad * scaled_grad;
-          T next_m_unbiased = m[i] / beta1_correction;
-          T next_v_unbiased = v[i] / beta2_correction;
-          T denom = std::sqrt(next_v_unbiased) + epsilon;
-          update[i] = (next_m_unbiased/denom) + (decay*p[i]);
+          r_g[ii] = g[i];
+          r_p[ii] = p[i];
+          r_m[ii] = m[i];
+          r_v[ii] = v[i];
+        } else {
+          r_g[ii] = GRAD_T(0);
+          r_p[ii] = T(0);
+          r_m[ii] = T(0);
+          r_v[ii] = T(0);
+        }
+      }
+#pragma unroll
+      for(int ii = 0; ii < ILP; ii++)
+      {
+        T scaled_grad = r_g[ii] / clipped_global_grad_norm;
+        r_m[ii] = r_m[ii] * beta1 + (1-beta1) * scaled_grad;
+        r_v[ii] = r_v[ii] * beta2 + (1-beta2) * scaled_grad * scaled_grad;
+        T next_m_unbiased = r_m[ii] / beta1_correction;
+        T next_v_unbiased = r_v[ii] / beta2_correction;
+        T denom = std::sqrt(next_v_unbiased) + epsilon;
+        r_p[ii] = (next_m_unbiased/denom) + (decay*r_p[ii]);
+      }
+#pragma unroll
+      for(int ii = 0; ii < ILP; ii++)
+      {
+        int i = i_start + threadIdx.x + ii*blockDim.x;
+        if(i < n && i < chunk_size)
+        {
+          update[i] = (UPD_T)r_p[ii];
+          m[i] = r_m[ii];
+          v[i] = r_v[ii];
         }
       }
     }
@@ -90,30 +118,32 @@ void multi_tensor_lamb_stage1_cuda(
   const float beta1,
   const float beta2,
   const float epsilon,
-  const float global_grad_norm,
+  at::Tensor global_grad_norm,
   const float max_global_grad_norm)
 {
   using namespace at;
 
-  float clipped_global_grad_norm = global_grad_norm > max_global_grad_norm ? global_grad_norm / max_global_grad_norm : 1.0f;
+  const float* g_grad_norm = global_grad_norm.DATA_PTR<float>();
+  float clipped_global_grad_norm = *(g_grad_norm) > max_global_grad_norm ? *(g_grad_norm) / max_global_grad_norm : 1.0f;
   float next_step = float(step+1);
   float beta1_correction = 1.0f - std::pow(beta1, next_step);
   float beta2_correction = 1.0f - std::pow(beta2, next_step);
   DISPATCH_FLOAT_AND_HALF(tensor_lists[0][0].scalar_type(), 0, "lamb_stage_1",
     DISPATCH_FLOAT_AND_HALF(tensor_lists[1][0].scalar_type(), 1, "lamb_stage_1",
-      multi_tensor_apply<5>(
-        BLOCK_SIZE,
-        chunk_size,
-        noop_flag,
-        tensor_lists,
-        LAMBStage1Functor<scalar_t_0, scalar_t_1>(),
-        per_tensor_decay.data<float>(),
-        beta1,
-        beta2,
-        beta1_correction,
-        beta2_correction,
-        epsilon,
-        clipped_global_grad_norm); ))
+      DISPATCH_FLOAT_AND_HALF(tensor_lists[4][0].scalar_type(), 2, "lamb_stage_1",
+        multi_tensor_apply<5>(
+          BLOCK_SIZE,
+          chunk_size,
+          noop_flag,
+          tensor_lists,
+          LAMBStage1Functor<scalar_t_0, scalar_t_1, scalar_t_2>(),
+          per_tensor_decay.DATA_PTR<float>(),
+          beta1,
+          beta2,
+          beta1_correction,
+          beta2_correction,
+          epsilon,
+          clipped_global_grad_norm); )))
 
   AT_CUDA_CHECK(cudaGetLastError());
 

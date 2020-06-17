@@ -2,6 +2,8 @@ import torch
 from torch._six import string_classes
 import functools
 import numpy as np
+import sys
+from types import MethodType
 import warnings
 from ._amp_state import _amp_state, warn_or_err, container_abcs
 from .handle import disable_casts
@@ -9,10 +11,11 @@ from .scaler import LossScaler
 from ._process_optimizer import _process_optimizer
 from apex.fp16_utils import convert_network
 from ..fp16_utils import FP16_Optimizer as FP16_Optimizer_general
-from ..optimizers import FP16_Optimizer as FP16_Optimizer_for_fused
-from ..optimizers import FusedAdam
-from ..parallel import DistributedDataParallel as apex_DDP
-from ..parallel.LARC import LARC
+from ..contrib.optimizers import FP16_Optimizer as FP16_Optimizer_for_fused
+
+if torch.distributed.is_available():
+    from ..parallel import DistributedDataParallel as apex_DDP
+    from ..parallel.LARC import LARC
 
 
 def to_type(dtype, t):
@@ -40,12 +43,12 @@ def applier(value, fn):
         return value
     elif isinstance(value, np.ndarray):
         return value
+    elif hasattr(value, "to"): # Allow handling of custom batch classes
+        return fn(value)
     elif isinstance(value, container_abcs.Mapping):
         return {applier(k, fn) : applier(v, fn) for k, v in value.items()}
     elif isinstance(value, container_abcs.Iterable):
         return type(value)(applier(v, fn) for v in value)
-    elif hasattr(value, "to"): # Allow handling of custom batch classes
-        return fn(value)
     else:
         # Do I want this to fire off even if someone chooses to pass something ordinary like
         # an int or float?  May be more annoying than it's worth.
@@ -63,7 +66,7 @@ def check_models(models):
         parallel_type = None
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
             parallel_type = "torch.nn.parallel.DistributedDataParallel"
-        if isinstance(model, apex_DDP):
+        if ('apex_DDP' in sys.modules) and isinstance(model, apex_DDP):
             parallel_type = "apex.parallel.DistributedDataParallel"
         if isinstance(model, torch.nn.parallel.DataParallel):
             parallel_type = "torch.nn.parallel.DataParallel"
@@ -124,35 +127,26 @@ def check_optimizers(optimizers):
             raise RuntimeError("An incoming optimizer is an instance of {}. ".format(bad_optim_type) +
                                "The optimizer(s) passed to amp.initialize() must be bare \n"
                                "instances of either ordinary Pytorch optimizers, or Apex fused \n"
-                               "optimizers (currently just FusedAdam, but FusedSGD will be added \n"
-                               "soon).  You should not manually wrap your optimizer in either \n"
-                               "apex.fp16_utils.FP16_Optimizer or apex.optimizers.FP16_Optimizer. \n"
-                               "amp.initialize will take care of that for you (if necessary) based \n"
-                               "on the specified opt_level (and optional overridden properties).")
+                               "optimizers.\n")
 
 
-def wrap_fused_adam(optimizer, properties):
-    msg = 'Currently, the usage of FusedAdam is restricted to '\
-          'amp.initialize(..., opt_level="O2", keep_batchnorm_fp32=False, '\
-          'loss_scale=float or "dynamic").  We are working on enabling more general usage.'
+class O2StateDictHook(object):
+    def __init__(self, fn):
+        self.fn = fn
 
-    assert properties.master_weights is True, msg
-    assert properties.cast_model_type is torch.float16, msg
-    assert (properties.keep_batchnorm_fp32 is False or
-            properties.keep_batchnorm_fp32 is None), msg
-
-    if properties.loss_scale == "dynamic":
-        return FP16_Optimizer_for_fused(optimizer, dynamic_loss_scale=True)
-    else:
-        return FP16_Optimizer_for_fused(optimizer, static_loss_scale=properties.loss_scale)
+    def __call__(self, module, state_dict, prefix, local_metadata):
+        for key in state_dict:
+            param = state_dict[key]
+            if 'Half' in param.type():
+                param = param.to(torch.float32)
+                state_dict[key] = param
 
 
 def _initialize(models, optimizers, properties, num_losses=1, cast_model_outputs=None):
-    from apex.parallel import DistributedDataParallel as apex_DDP
     from .amp import init as amp_init
 
     optimizers_was_list = False
-    if isinstance(optimizers, torch.optim.Optimizer) or isinstance(optimizers, LARC):
+    if isinstance(optimizers, torch.optim.Optimizer) or ('LARC' in globals() and isinstance(optimizers, LARC)):
         optimizers = [optimizers]
     elif optimizers is None:
         optimizers = []
@@ -175,7 +169,6 @@ def _initialize(models, optimizers, properties, num_losses=1, cast_model_outputs
 
     if not _amp_state.allow_incoming_model_not_fp32:
         check_params_fp32(models)
-
 
     # In the future, when FP16_Optimizer can be deprecated and master weights can
     # become an attribute, remember to stash master weights before casting the model.
@@ -207,9 +200,15 @@ def _initialize(models, optimizers, properties, num_losses=1, cast_model_outputs
 
             model.forward = patch_forward(model.forward)
 
-        # State dict trick to recast any preexisting per-param state tensors 
+        # State dict trick to recast any preexisting per-param state tensors
         for optimizer in optimizers:
             optimizer.load_state_dict(optimizer.state_dict())
+
+        # patch model.state_dict() to return float32 params
+        for model in models:
+            for module in model.modules():
+                module._register_state_dict_hook(O2StateDictHook(functools.partial(to_type, torch.float32)))
+
     elif cast_model_outputs is not None:
         output_caster = functools.partial(to_type, cast_model_outputs)
 
@@ -223,11 +222,7 @@ def _initialize(models, optimizers, properties, num_losses=1, cast_model_outputs
             model.forward = patch_forward(model.forward)
 
     for i, optimizer in enumerate(optimizers):
-        # Still need to special case this for the first pass
-        if isinstance(optimizer, FusedAdam):
-            optimizers[i] = wrap_fused_adam(optimizer, properties)
-        else:
-            optimizers[i] = _process_optimizer(optimizer, properties)
+        optimizers[i] = _process_optimizer(optimizer, properties)
 
     _amp_state.loss_scalers = []
     for _ in range(num_losses):
@@ -242,13 +237,13 @@ def _initialize(models, optimizers, properties, num_losses=1, cast_model_outputs
             # Disable Amp casting for the optimizer step, because it should only be
             # applied to FP32 master params anyway.
             def patch_step(old_step):
-                def new_step(*args, **kwargs):
+                def new_step(self, *args, **kwargs):
                     with disable_casts():
                         output = old_step(*args, **kwargs)
                     return output
                 return new_step
 
-            optimizer.step = patch_step(optimizer.step)
+            optimizer.step = MethodType(patch_step(optimizer.step), optimizer)
 
     if optimizers_was_list:
         if models_was_list:
